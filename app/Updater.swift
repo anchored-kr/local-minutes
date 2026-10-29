@@ -42,28 +42,58 @@ final class Updater: ObservableObject {
     @AppStorage("autoUpdateCheck") var autoCheck = true
     @AppStorage("lastUpdateCheck") private var lastCheck = 0.0
 
+    private var timer: Timer?
+
+    /// 앱을 켤 때마다 확인하고(새 버전이 있으면 업데이트 창), 켜 둔 동안에는 6시간마다 확인한다.
     func checkOnLaunch() {
-        guard autoCheck, isBundledEngine, Date().timeIntervalSince1970 - lastCheck > 6 * 3600 else { return }
+        guard autoCheck, isBundledEngine else { return }
         Task { await check(manual: false) }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.autoCheck, self.available == nil else { return }
+                await self.check(manual: false)
+            }
+        }
     }
 
+    /// GitHub API 는 쓰지 않는다 — 비로그인 요청은 같은 인터넷 주소(IP)를 쓰는 사람 모두가 시간당 60번을 나눠 써서,
+    /// 회사 네트워크에서 한도가 바닥나 "업데이트 정보를 받지 못했습니다"가 떴다(2026-10-29, 403).
+    /// 대신 /releases/latest 가 /releases/tag/vX.Y.Z 로 넘겨 주는 것으로 최신 버전을 알고, 파일 · 노트는 공개 다운로드 주소로 받는다.
     func check(manual: Bool) async {
         lastCheck = Date().timeIntervalSince1970
-        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(updateRepo)/releases/latest")!)
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.timeoutInterval = 15
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
-                if manual { state = "업데이트 정보를 받지 못했습니다." }
+            var latest = URLRequest(url: URL(string: "https://github.com/\(updateRepo)/releases/latest")!)
+            latest.httpMethod = "HEAD"
+            latest.timeoutInterval = 15
+            let (_, resp) = try await URLSession.shared.data(for: latest)
+            guard let url = resp.url, url.path.contains("/releases/tag/") else {
+                if manual { state = "릴리스를 찾지 못했습니다." }
                 return
             }
-            let r = try JSONDecoder().decode(Release.self, from: data)
-            if isNewer(r.version, than: currentVersion) {
-                available = r
-            } else if manual {
-                state = "최신 버전입니다 (\(currentVersion))."
+            let tag = url.lastPathComponent
+            let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            guard isNewer(version, than: currentVersion) else {
+                if manual { state = "최신 버전입니다 (\(currentVersion))." }
+                return
             }
+            let base = "https://github.com/\(updateRepo)/releases/download/\(tag)/"
+            let zipName = "LocalMinutes-\(version).zip"
+            var notes = ""
+            if let (d, r) = try? await URLSession.shared.data(from: URL(string: base + "RELEASE_NOTES.md")!),
+               (r as? HTTPURLResponse)?.statusCode == 200 {
+                notes = String(decoding: d, as: UTF8.self)
+            }
+            var size: Int64?
+            var head = URLRequest(url: URL(string: base + zipName)!)
+            head.httpMethod = "HEAD"
+            if let (_, r) = try? await URLSession.shared.data(for: head), r.expectedContentLength > 0 {
+                size = r.expectedContentLength
+            }
+            available = Release(tag_name: tag, name: nil, body: notes.isEmpty ? nil : notes, assets: [
+                .init(name: zipName, browser_download_url: base + zipName, size: size),
+                .init(name: zipName + ".sha256", browser_download_url: base + zipName + ".sha256", size: nil),
+            ])
         } catch {
             if manual { state = "업데이트 확인 실패: \(error.localizedDescription)" }
         }
@@ -209,8 +239,8 @@ struct UpdateSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("새 버전 \(release.version)").font(.title2.weight(.semibold))
-            Text("지금 버전 \(currentVersion)").foregroundStyle(.secondary)
+            Text("새 버전 \(release.version)이 나왔습니다").font(.title2.weight(.semibold))
+            Text("지금 버전 \(currentVersion) · 지금 업데이트할까요? 회의 기록은 그대로 남습니다.").foregroundStyle(.secondary)
             ScrollView {
                 Text(release.body ?? "")
                     .frame(maxWidth: .infinity, alignment: .leading)

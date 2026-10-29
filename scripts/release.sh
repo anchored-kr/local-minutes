@@ -35,5 +35,6 @@ git add app/Info.plist
 git commit -q -m "release: $version"
 git tag "v$version"
 git push -q origin HEAD "v$version"
-gh release create "v$version" "$zip" "$zip.sha256" --repo "$repo" --title "LocalMinutes $version" --notes "$notes"
+print -r -- "$notes" > dist/RELEASE_NOTES.md   # 앱은 API 대신 이 파일로 노트를 읽는다(API 한도 때문)
+gh release create "v$version" "$zip" "$zip.sha256" dist/RELEASE_NOTES.md --repo "$repo" --title "LocalMinutes $version" --notes "$notes"
 echo "올림: https://github.com/$repo/releases/tag/v$version"
