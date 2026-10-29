@@ -51,7 +51,8 @@ rm -rf "$engine/python/include" "$engine/python/share" "$engine/python/lib/tcl"*
 rm -f "$engine/python/lib/python3.14/EXTERNALLY-MANAGED"
 uv pip install --quiet --offline --python "$engine/python/bin/python3" "sherpa-onnx==2.0.1" "numpy==2.5.4"
 # 필요 없는 것 빼기(pip · 테스트), 만든 맥의 경로가 박힌 sysconfig 를 일반 경로로
-find "$engine/python/bin" -type f ! -name "python3*" -delete   # 보조 스크립트(경로가 박힘) — 앱은 python3 만 쓴다
+# 보조 스크립트(만든 맥의 경로가 박힘)와 그 링크를 뺀다 — 앱은 python3 만 쓴다. 깨진 링크가 남으면 서명 검증이 실패한다.
+find "$engine/python/bin" -mindepth 1 ! -name python ! -name python3 ! -name python3.14 -delete
 rm -rf "$engine/python/lib/python3.14/site-packages/"pip* \
        "$engine/python/lib/python3.14/site-packages/numpy/"{tests,*/tests,_core/tests}
 sed -i '' "s#${py_home}#/LocalMinutes/engine/python#g" "$engine/python/lib/python3.14/"_sysconfigdata_*.py
