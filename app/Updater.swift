@@ -5,7 +5,7 @@ import AppKit
 import Foundation
 import SwiftUI
 
-let updateRepo = "attereum/local-minutes"
+let updateRepo = "anchored-kr/local-minutes"
 
 struct Release: Decodable, Identifiable {
     var id: String { tag_name }

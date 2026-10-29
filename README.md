@@ -28,7 +28,7 @@ macOS 샌드박스 안에서 돌고, 샌드박스는 이 맥 자신(localhost)�
 
 필요: **Apple Silicon 맥(M1 이후) · macOS 15 이상 · 메모리 32 GB 이상 · 디스크 약 20 GB**
 
-1. [Releases](https://github.com/attereum/local-minutes/releases/latest) 에서 `LocalMinutes-버전.zip` 을 받아 연다.
+1. [Releases](https://github.com/anchored-kr/local-minutes/releases/latest) 에서 `LocalMinutes-버전.zip` 을 받아 연다.
 2. 나온 **LocalMinutes** 를 **응용 프로그램** 폴더로 옮긴다(그래야 업데이트가 된다).
 3. 더블클릭 → "확인되지 않은 개발자" 경고가 뜨면 **완료**를 누르고,
    **시스템 설정 → 개인정보 보호 및 보안** 맨 아래 "LocalMinutes 이(가) 차단되었습니다" 옆 **그래도 열기** → 암호.

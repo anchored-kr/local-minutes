@@ -9,7 +9,7 @@
 # 마이크 · 화면 녹음 권한도 다시 받아야 한다.
 set -euo pipefail
 root=${0:A:h:h}
-repo="attereum/local-minutes"
+repo="anchored-kr/local-minutes"
 version=${1:?버전을 주세요. 예: scripts/release.sh 1.0.1 "고친 것"}
 shift
 [[ $version =~ '^[0-9]+\.[0-9]+\.[0-9]+$' ]] || { echo "버전은 1.2.3 꼴"; exit 1; }
