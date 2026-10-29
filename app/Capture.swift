@@ -45,6 +45,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private var chunkIndex = 0
     private var chunkMic: [Float] = []
     private var chunkSys: [Float] = []
+    /// 채널마다 잡음 바닥(10ms RMS). 내려갈 때는 빠르게, 올라갈 때는 아주 천천히 따라간다.
+    private var floors: [Float?] = [nil, nil]
     private(set) var startedAt = Date()
 
     init(rawURL: URL) {
@@ -227,7 +229,26 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         pcm.withUnsafeBufferPointer { raw?.write(Data(buffer: $0)) }
         chunkMic.append(contentsOf: mic)
         chunkSys.append(contentsOf: sys)
+        updateFloors(mic, sys)
         written = target
+    }
+
+    private func updateFloors(_ mic: [Float], _ sys: [Float]) {
+        let block = Self.rate / 100
+        for (c, x) in [mic, sys].enumerated() {
+            var i = 0
+            while i + block <= x.count {
+                var sum: Float = 0
+                for j in i..<(i + block) { sum += x[j] * x[j] }
+                let r = (sum / Float(block)).squareRoot()
+                if let f = floors[c] {
+                    floors[c] = r < f ? f * 0.5 + r * 0.5 : f + (r - f) * 0.0005
+                } else {
+                    floors[c] = r
+                }
+                i += block
+            }
+        }
     }
 
     private func emitChunk(force: Bool) {
@@ -236,14 +257,19 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         if !force {
             if len < Self.minChunk { return }
             if len < Self.maxChunk {
-                // 마지막 0.3초가 조용할 때만 자른다.
-                let tail = Self.rate * 3 / 10
-                var sum: Float = 0
-                for i in (len - tail)..<len {
-                    let v = (chunkMic[i] + chunkSys[i]) / 2
-                    sum += v * v
+                // 마지막 0.3초 동안 모든 채널이 그 채널의 말소리 기준(잡음 바닥의 5배) 아래일 때만 자른다.
+                // 고정값(0.01)으로 보면 작은 마이크로 말하는 도중에 잘라 문장 뒤가 사라졌다(2026-10-29).
+                let block = Self.rate / 100, tail = Self.rate * 3 / 10
+                for (ch, f) in [(chunkMic, floors[0]), (chunkSys, floors[1])] {
+                    let thr = max(5 * (f ?? 0), 40 / 32768)
+                    var i = len - tail
+                    while i + block <= len {
+                        var sum: Float = 0
+                        for j in i..<(i + block) { sum += ch[j] * ch[j] }
+                        if (sum / Float(block)).squareRoot() >= thr { return }
+                        i += block
+                    }
                 }
-                if (sum / Float(tail)).squareRoot() > 0.01 { return }
             }
         } else if len < Self.rate / 2 {
             return

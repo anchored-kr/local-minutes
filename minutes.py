@@ -279,7 +279,11 @@ def context_terms(context, lang="auto", limit=120):
     items = []
     for m in TERM_LINE.finditer(context):
         items += [t.strip(" .·") for t in re.split(r"[,，、·/]|\s{2,}", m.group(2))]
-    items += PROPER.findall(context)
+    # 고유명사는 자주 나온 순(긴 맥락에서 'Meeting', 'Due' 같은 한 번 나온 대문자 낱말이 섞이지 않게)
+    counts = {}
+    for w in PROPER.findall(context):
+        counts[w] = counts.get(w, 0) + 1
+    items += sorted(counts, key=lambda w: -counts[w])
     out, seen = [], set()
     for t in items:
         t = re.sub(r"\(.*?\)", "", t).strip(" .·:-")
@@ -300,13 +304,25 @@ def context_terms(context, lang="auto", limit=120):
 
 
 def whisper_prompt(terms="", previous="", lang="auto"):
-    """whisper 초기 프롬프트 = 용어 목록뿐. 앞 문장은 넘기지 않는다 — 한 번 생긴 헛문장이 다음 조각으로
-    이어져 반복됐다(2026-10-29). previous 는 호환용으로만 받는다."""
+    """whisper 초기 프롬프트: 회의 언어로 된 짧은 문장 안에 용어를 넣는다.
+
+    'Glossary: A, B, C.' 같은 목록을 주면 whisper 가 전사를 'Braden Kelley: …' 처럼 이름 꼬리표 꼴로 흉내 내거나
+    용어만 되뇌었고, 프롬프트가 없으면 문장 부호가 사라졌다. 문장형이 꼬리표 0 · 내용 온전으로 가장 좋았다(2026-10-29 실제 회의 비교).
+    앞 문장은 넘기지 않는다 — 한 번 생긴 헛문장이 다음 조각으로 이어져 반복됐다. previous 는 호환용으로만 받는다.
+    """
     glossary = ""
     if GLOSSARY.exists():
         glossary = ", ".join(l.strip() for l in GLOSSARY.read_text(encoding="utf-8").splitlines() if l.strip() and not l.startswith("#"))
-    words = ", ".join(p for p in (context_terms(glossary, lang, 80) if glossary else "", context_terms(terms, lang)) if p)
-    return f"Glossary: {words}." if words else ""
+    words = [w for w in (context_terms(glossary, lang, 60) if glossary else "").split(", ") if w]
+    words += [w for w in context_terms(terms, lang, 100).split(", ") if w and w not in words]
+    words = words[:8]
+    if not words:
+        return ""
+    if lang == "ko" or (lang == "auto" and any(HANGUL_KANA.search(w) for w in words) and not any(re.search("[ぁ-んァ-ヶ]", w) for w in words)):
+        return f"안녕하세요. 오늘은 {', '.join(words)}에 대해 이야기하겠습니다."
+    if lang == "ja":
+        return f"こんにちは。今日は{'、'.join(words)}について話します。"
+    return f"Hello everyone. Today we'll talk about {', '.join(words)}."
 
 
 def transcribe(mono, out, lang, use_vad=False, context="", name="whisper", terms=""):
@@ -347,7 +363,22 @@ def channel_levels(path):
     return levels
 
 
-def label_speakers(segs, audio):
+SPEECH_X = 5        # 말소리 = 그 채널 잡음 바닥의 5배 이상
+SPEECH_MIN = 40     # 잡음 바닥이 0 에 가까운 채널(시스템 소리)의 최소 기준
+
+
+def noise_floor(levels_ch):
+    v = sorted(levels_ch)
+    return v[len(v) // 10] if v else 0.0
+
+
+def speech_thresholds(floors):
+    """채널마다 '말소리' 기준. 고정값(RMS 150)은 작은 마이크(말소리 85~850)의 진짜 말까지 버렸고, 회의 전 헛문장은
+    마이크 잡음 바닥(13~22) 수준이었다(2026-10-29 실제 회의 측정). 그래서 채널마다 잡음 바닥의 몇 배로 정한다."""
+    return [max(SPEECH_X * f, SPEECH_MIN) for f in floors]
+
+
+def label_speakers(segs, audio, state=None):
     """소리 크기로 문장을 거르고, 스테레오면 말한 사람을 정한다.
 
     - 모든 채널이 조용한 구간의 문장은 버린다. VAD 없이 돌린 whisper 가 무음에서 지어낸 문장이다.
@@ -356,6 +387,12 @@ def label_speakers(segs, audio):
       스피커로 들은 상대 소리가 마이크로 다시 들어가도(에코) 시스템 쪽이 더 크게 잡힌다.
     """
     levels = channel_levels(audio)
+    floors = [noise_floor(ch) for ch in levels]
+    if state is not None:   # 회의 동안 본 가장 낮은 바닥을 쓴다(말이 꽉 찬 조각은 바닥이 높게 잡히므로)
+        prev = getattr(state, "floors", None) or floors
+        floors = [min(a, b) for a, b in zip(prev, floors)] if len(prev) == len(floors) else floors
+        state.floors = floors
+    thr = speech_thresholds(floors)
 
     def seg_level(ch, s):
         a = int(s["start"] * 100)
@@ -373,9 +410,9 @@ def label_speakers(segs, audio):
     kept = []
     for i, s in enumerate(segs):
         lv = [per[c][i] / norms[c] for c in range(len(levels))]
-        # 채널마다 맞춘 값이 작거나, 두 채널 모두 실제 소리가 아주 작으면(약 -47 dBFS 미만) 무음에서 지어낸 문장이다
-        # (2026-10-29 회의 시작 전 3분: "I'm going to go ahead and get started").
-        if max(lv) < 0.05 or max(per[c][i] for c in range(len(levels))) < 150:
+        # 모든 채널이 그 채널의 말소리 기준보다 작으면 무음 · 잡음에서 지어낸 문장이다
+        # (2026-10-29 회의 시작 전 3분: "I'm going to go ahead and get started" — 마이크 17~22, 잡음 바닥 13~15).
+        if all(per[c][i] < thr[c] for c in range(len(levels))):
             continue
         if len(lv) == 2:
             s["speaker"] = "나" if lv[0] >= lv[1] else "상대"
@@ -890,8 +927,23 @@ Return JSON with these keys, all values written in {out_lang}:
 - "attendees": one line listing attendees with affiliation/role in parentheses where known
 - "project": the project this meeting is about (one line), or "" if none
 - "purpose": the purpose of the meeting (one sentence)
-- "note": one sentence clarifying a likely confusion (e.g. two similar projects), or "" if none""", max_tokens=800, json_mode=True)
+- "note": one sentence clarifying a likely confusion (e.g. two similar projects), or "" if none
+- "speakers": an object mapping transcript speaker labels to real names, ONLY when clearly identifiable from the
+  transcript, notes or context (e.g. someone introduces themselves, is addressed by name, or the context lists one external
+  attendee). Omit labels you are not sure about. Example: {{"상대1": "Braden"}}""", max_tokens=900, json_mode=True)
         meta = loads_json(meta_raw)
+        # 이름을 안 붙인 화자는 회의 정보 단계가 확실하다고 본 이름으로 쓴다(Gemini 회의록처럼 사람 이름으로 쓰기 위해, 2026-10-29)
+        guessed = {k: str(v).strip() for k, v in (meta.get("speakers") or {}).items()
+                   if isinstance(k, str) and str(v).strip() and k not in names}
+        raw_labels = {s.get("speaker") for s in segs}
+        guessed = {k: v for k, v in guessed.items() if k in raw_labels or k in speakers}
+        if guessed:
+            back = {display_name(k, lang, {}): k for k in raw_labels if k}
+            names = dict(names, **{back.get(k, k): v for k, v in guessed.items()})
+            turns = transcript_turns(segs, lang, names)
+            full = turns_text(turns)
+            background += f"\n\nSpeaker labels resolved to names in the transcript below: {json.dumps(guessed, ensure_ascii=False)}."
+            say(f"  화자 이름 추정: {guessed}")
         say(f"  ① 회의 정보 · {time.time() - t0:.0f}초")
         # ② 목차
         outline_raw, _ = llm.chat(DETAIL_SYSTEM, f"""{background}
@@ -910,7 +962,10 @@ Return JSON: {{"sections": [{{"title": "...in {out_lang}", "ranges": [["mm:ss", 
         say(f"  ② 목차 {len(sections)}개 · {time.time() - t0:.0f}초")
         if not sections:
             raise RuntimeError("목차를 만들지 못했습니다")
-        titles = "\n".join(f"{i + 2}. {s.get('title', '')}" for i, s in enumerate(sections))
+        # 다른 절의 요점까지 보여 줘야 같은 사실을 여러 절에 되풀이하지 않는다(2026-10-29: VFX · 맵 내용이 두 절씩 반복)
+        titles = "\n".join(f"{i + 2}. {s.get('title', '')} — {'; '.join(map(str, s.get('points', [])[:6]))}"
+                           for i, s in enumerate(sections))
+        known = context_terms(context, "auto", 300) if context else ""
         facts = (f"Meeting facts: project = {meta.get('project') or '?'}; attendees = {meta.get('attendees') or '?'}; "
                  f"purpose = {meta.get('purpose') or '?'}")
         # ③ 주제마다 절
@@ -925,8 +980,11 @@ Return JSON: {{"sections": [{{"title": "...in {out_lang}", "ranges": [["mm:ss", 
 
 {facts}
 
-All sections of the minutes (write ONLY section {n}; do not repeat other sections' content):
+All sections of the minutes with their key points (write ONLY section {n}. Facts that belong to another section's
+points must not be explained again here — at most refer to that section in a few words):
 {titles}
+{f"Correct spellings of names and terms in this meeting: {known}. When the transcript has a similar-sounding word "
+ f"(speech recognition error, e.g. 'Giga' for 'GeekOut'), write the correct term." if known else ""}
 
 Points to cover in section {n}: {json.dumps(sec.get('points', []), ensure_ascii=False)}
 
@@ -942,6 +1000,8 @@ Format (GitHub Markdown):
 - Use a table when comparing items (people/roles, tools, costs, schedule phases, assets).
 - Use numbered steps for processes.
 - Keep every concrete number, price, period, tool and name mentioned.
+- After each subsection heading's first paragraph, cite where it was said as a timestamp in parentheses, e.g. "(13:16)",
+  using the [mm:ss] times in the transcript excerpt, so readers can find it in the transcript.
 - End a subsection with what is still undecided or needs confirmation, when relevant.
 - Roughly 250-700 words depending on how much was said. No preamble, no closing remarks.""", max_tokens=3500)
             body = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", body.strip())
@@ -1151,7 +1211,7 @@ class MeetingState:
                 lead += 1
             else:
                 break
-        if lead and len(parts) > lead and "," in text:
+        if lead and not stripped and len(parts) > lead and "," in text:
             rest = re.split(r"[,:]", text, maxsplit=lead)[-1].strip()
             rest = re.sub(r"^(and|or)\s+", "", rest)
             # 용어가 둘 이상이면 떼고, 하나면('Mao, can you hear me?' 처럼 부르는 말일 수 있어) 남는 게 없을 때만 버린다
@@ -1310,7 +1370,7 @@ def worker(args):
                 mono.unlink(missing_ok=True)
                 segs = st.segments(res)
                 st.observe(res, len(segs))
-                segs = label_speakers(segs, stereo) if segs else []
+                segs = label_speakers(segs, stereo, st) if segs else []
                 off = float(req.get("offset", 0))
                 if sp and segs:
                     if meeting not in live:
@@ -1353,24 +1413,33 @@ def chunk(args):
 
 
 def slice_windows(stereo, min_s=10, max_s=28):
-    """녹음을 말이 끊긴 곳(0.3초 조용)에서 10~28초 창으로 나눈다. [(시작 표본, 끝 표본)]."""
+    """녹음을 말이 끊긴 곳(0.3초 동안 모든 채널이 말소리 기준 아래)에서 10~28초 창으로 나눈다.
+
+    고정값(RMS 330)으로 '조용함'을 보면 작은 마이크로 말하는 도중에 잘라 문장 뒤가 사라졌다(2026-10-29).
+    돌려주는 값: ([(시작 표본, 끝 표본)], 표본률, 표본 배열, 채널별 잡음 바닥).
+    """
+    levels = channel_levels(stereo)          # 채널마다 초당 100칸
+    floors = [noise_floor(ch) for ch in levels]
+    thr = speech_thresholds(floors)
     with wave.open(str(stereo)) as w:
         rate, n = w.getframerate(), w.getnframes()
         a = array.array("h", w.readframes(n))
-    step, quiet = rate // 10, int(rate * 0.3)
-    cuts, start, k = [], 0, 0
-    while k < n:
-        k = min(n, k + step)
-        length = k - start
+    cuts, start = [], 0
+    total = len(levels[0])
+    k = 0
+    while k < total:
+        k = min(total, k + 10)                 # 0.1초씩
+        length = (k * rate // 100) - start
         if length >= max_s * rate:
-            cuts.append((start, k)); start = k
-        elif length >= min_s * rate:
-            tail = a[2 * (k - quiet):2 * k]
-            if tail and (sum(v * v for v in tail[::8]) / max(1, len(tail[::8]))) ** 0.5 < 330:
-                cuts.append((start, k)); start = k
+            end = k * rate // 100
+            cuts.append((start, end)); start = end
+        elif length >= min_s * rate and k >= 30:
+            if all(max(ch[k - 30:k]) < t for ch, t in zip(levels, thr)):
+                end = k * rate // 100
+                cuts.append((start, end)); start = end
     if n - start > rate // 2:
         cuts.append((start, n))
-    return cuts, rate, a
+    return cuts, rate, a, floors
 
 
 def retranscribe(args):
@@ -1391,7 +1460,8 @@ def retranscribe(args):
     try:
         st = MeetingState(lang)
         st.set_context(read_context(out))
-        cuts, rate, a = slice_windows(stereo)
+        cuts, rate, a, floors = slice_windows(stereo)
+        st.floors = floors
         for i, (b, e) in enumerate(cuts, 1):
             with wave.open(str(part), "wb") as w:
                 w.setnchannels(2); w.setsampwidth(2); w.setframerate(rate)
@@ -1401,7 +1471,7 @@ def retranscribe(args):
             res = server.transcribe(mono, st.lang, whisper_prompt(st.terms, lang=st.lang))
             got = st.segments(res)
             st.observe(res, len(got))
-            got = label_speakers(got, part) if got else []
+            got = label_speakers(got, part, st) if got else []
             for s in got:
                 s["start"] = round(s["start"] + b / rate, 2)
                 s["end"] = round(s["end"] + b / rate, 2)
