@@ -192,9 +192,14 @@ final class TranscribeWorker {
         }
     }
 
+    /// stdin 을 닫으면 작업자가 whisper-server 를 끄고 스스로 끝난다. 3초 안에 안 끝나면 종료 신호.
     func stop() {
         try? input?.close()
-        proc?.terminate()
+        if let p = proc {
+            let deadline = Date().addingTimeInterval(3)
+            while p.isRunning && Date() < deadline { usleep(100_000) }
+            if p.isRunning { p.terminate() }
+        }
         proc = nil
         input = nil
         output = nil
@@ -378,7 +383,22 @@ final class AppModel: ObservableObject {
 
     private var foldersFile: URL { meetingsRoot.appendingPathComponent("folders.json") }
 
+    /// 앱이 비정상으로 끝나 주인(launchd)만 남은 whisper-server · llama-server 를 치운다.
+    nonisolated static func cleanOrphans() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        p.arguments = ["-P", "1", "-f", "LocalMinutes/models/"]
+        try? p.run()
+        p.waitUntilExit()
+    }
+
+    func stopWorker() {
+        let w = worker
+        transcribeQueue.sync { w.stop() }
+    }
+
     init() {
+        Self.cleanOrphans()
         try? FileManager.default.createDirectory(at: meetingsRoot, withIntermediateDirectories: true)
         reload()
         selectedID = meetings.first?.id

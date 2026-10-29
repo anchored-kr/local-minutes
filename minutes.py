@@ -591,6 +591,13 @@ class LocalLLM:
              # 생각하기 끔: 149자 전사에 생각만 1,600 토큰을 써 80초 넘게 걸렸다(2026-10-28).
              "--reasoning-budget", "0"],
             stdout=self.log, stderr=subprocess.STDOUT)
+        try:
+            self._wait_ready()
+        except BaseException:
+            self.close()
+            raise
+
+    def _wait_ready(self):
         deadline = time.time() + 300
         while True:
             if self.proc.poll() is not None:
@@ -1067,6 +1074,14 @@ class WhisperServer:
             ["whisper-server", "-m", str(WHISPER_MODEL), "--host", "127.0.0.1", "--port", str(self.port),
              "-t", str(max(4, (os.cpu_count() or 8) - 2))],
             stdout=self.log, stderr=subprocess.STDOUT)
+        try:
+            self._wait_ready()
+        except BaseException:
+            # 모델을 읽는 동안 종료 신호 등으로 끊기면 막 띄운 서버가 주인 없이 남는다(2026-10-29 시험).
+            self.close()
+            raise
+
+    def _wait_ready(self):
         deadline = time.time() + 60
         while True:
             if self.proc.poll() is not None:
@@ -1116,7 +1131,7 @@ def worker(args):
     if not network_blocked():
         sys.exit("네트워크가 막히지 않았습니다. 안전을 위해 멈춥니다.")
     t0 = time.time()
-    server = WhisperServer()
+    server = WhisperServer()   # 준비 중에 끊기면 스스로 끈다
     sp = speakers_module()
     live = {}   # 회의 폴더 → LiveSpeakers
     say(f"전사 작업자 준비: {time.time() - t0:.1f}초 · 화자 분리 {'켬' if sp else '끔(.venv 없음)'}")
@@ -1287,6 +1302,9 @@ def main():
     c = sub.add_parser("check", help="점검")
     c.set_defaults(fn=check)
     a = p.parse_args()
+    # 종료 신호(앱의 terminate)를 받아도 finally 가 돌아 whisper-server · llama-server 를 끄게 한다.
+    # 그냥 죽으면 서버가 주인 없이 남아 메모리(whisper 약 1 GB · llama 약 17 GB)를 계속 쓴다(2026-10-29 발견).
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     if a.cmd == "record":
         a.out_lang = ""
         a.transcribe_only = False

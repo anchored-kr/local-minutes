@@ -12,6 +12,7 @@ struct Release: Decodable, Identifiable {
     struct Asset: Decodable {
         let name: String
         let browser_download_url: String
+        let size: Int64?
     }
     let tag_name: String
     let name: String?
@@ -36,6 +37,8 @@ final class Updater: ObservableObject {
     @Published var available: Release?
     @Published var state: String?
     @Published var busy = false
+    /// 받기 진행률(0~1). nil 이면 막대를 그리지 않는다.
+    @Published var progress: Double?
     @AppStorage("autoUpdateCheck") var autoCheck = true
     @AppStorage("lastUpdateCheck") private var lastCheck = 0.0
 
@@ -67,9 +70,14 @@ final class Updater: ObservableObject {
     }
 
     /// 받기 → SHA-256 확인 → 풀기 → 서명 요건이 지금 앱과 같은지 확인 → 앱을 닫고 바꿔 끼운 뒤 다시 연다.
-    func install(_ r: Release, canQuit: () -> Bool) {
+    /// beforeQuit: 전사 작업자 같은 자식 프로세스를 먼저 내린다.
+    func install(_ r: Release, canQuit: () -> Bool, beforeQuit: @escaping () -> Void) {
         guard canQuit() else {
             state = "녹음 · 회의록 작업이 끝난 뒤 업데이트하세요."
+            return
+        }
+        guard !Bundle.main.bundlePath.contains("/AppTranslocation/") else {
+            state = "LocalMinutes 를 '응용 프로그램' 폴더로 옮긴 뒤 다시 열고 업데이트하세요."
             return
         }
         guard let zip = r.assets.first(where: { $0.name.hasSuffix(".zip") }),
@@ -78,17 +86,26 @@ final class Updater: ObservableObject {
             return
         }
         busy = true
+        progress = 0
         state = "내려받는 중…"
+        let total = zip.size ?? 0
         Task.detached {
-            let result = Self.prepare(zipURL: zip.browser_download_url, sumURL: sum.browser_download_url)
+            let result = Self.prepare(zipURL: zip.browser_download_url, sumURL: sum.browser_download_url, total: total) { phase, value in
+                Task { @MainActor in
+                    self.state = phase
+                    self.progress = value
+                }
+            }
             await MainActor.run {
                 switch result {
                 case .failure(let e):
                     self.busy = false
+                    self.progress = nil
                     self.state = e.message
                 case .success(let newApp):
+                    self.progress = 1
                     self.state = "다시 여는 중…"
-                    Self.swapAndRelaunch(newApp)
+                    Self.swapAndRelaunch(newApp, beforeQuit: beforeQuit, dismiss: { self.available = nil })
                 }
             }
         }
@@ -109,18 +126,37 @@ final class Updater: ObservableObject {
         return (p.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
-    nonisolated private static func prepare(zipURL: String, sumURL: String) -> Result<URL, Fail> {
+    nonisolated private static func prepare(zipURL: String, sumURL: String, total: Int64,
+                                            report: @escaping (String, Double?) -> Void) -> Result<URL, Fail> {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("LocalMinutesUpdate-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         let zip = tmp.appendingPathComponent("update.zip"), sum = tmp.appendingPathComponent("update.sha256")
-        for (u, f) in [(zipURL, zip), (sumURL, sum)] {
-            let (c, o) = sh("/usr/bin/curl", ["-L", "--fail", "--silent", "--show-error", "--retry", "3", "-o", f.path, u])
-            if c != 0 { return .failure(Fail(message: "업데이트 내려받기 실패: \(o)")) }
+        let (sc, so) = sh("/usr/bin/curl", ["-L", "--fail", "--silent", "--show-error", "--retry", "3", "-o", sum.path, sumURL])
+        if sc != 0 { return .failure(Fail(message: "업데이트 내려받기 실패: \(so)")) }
+        // zip 은 받는 동안 파일 크기를 보며 진행률을 알린다.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        p.arguments = ["-L", "--fail", "--silent", "--show-error", "--retry", "3", "-o", zip.path, zipURL]
+        let err = Pipe()
+        p.standardError = err
+        do { try p.run() } catch { return .failure(Fail(message: "curl 을 실행하지 못했습니다.")) }
+        while p.isRunning {
+            let got = (try? FileManager.default.attributesOfItem(atPath: zip.path)[.size] as? Int64) ?? 0
+            let mb = { (b: Int64) in String(format: "%.0f", Double(b) / 1_000_000) }
+            report(total > 0 ? "내려받는 중… \(mb(got)) / \(mb(total)) MB" : "내려받는 중… \(mb(got)) MB",
+                   total > 0 ? min(0.9, 0.9 * Double(got) / Double(total)) : nil)
+            usleep(200_000)
         }
+        if p.terminationStatus != 0 {
+            let o = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            return .failure(Fail(message: "업데이트 내려받기 실패: \(o)"))
+        }
+        report("파일 확인 중(SHA-256 · 서명)…", 0.92)
         let expected = readText(sum).split(separator: " ").first.map(String.init) ?? ""
         guard let got = try? sha256(of: zip), !expected.isEmpty, got == expected else {
             return .failure(Fail(message: "업데이트 파일 해시가 맞지 않습니다. 설치하지 않았습니다."))
         }
+        report("압축 푸는 중…", 0.95)
         let (c, o) = sh("/usr/bin/ditto", ["-x", "-k", zip.path, tmp.path])
         guard c == 0 else { return .failure(Fail(message: "압축 풀기 실패: \(o)")) }
         let newApp = tmp.appendingPathComponent("LocalMinutes.app")
@@ -139,7 +175,10 @@ final class Updater: ObservableObject {
         return .success(newApp)
     }
 
-    private static func swapAndRelaunch(_ newApp: URL) {
+    /// 교체 스크립트를 띄우고 앱을 끝낸다. 스크립트는 앱이 끝나기를 기다렸다가 바꿔 끼우고 다시 연다.
+    /// 1.0.0 에서는 업데이트 창(시트)이 열린 채 NSApp.terminate 를 불러 앱이 꺼지지 않고 "다시 여는 중…"에 멈췄다
+    /// (2026-10-29). 창을 먼저 닫고, 그래도 2초 안에 안 끝나면 exit 로 끝낸다.
+    private static func swapAndRelaunch(_ newApp: URL, beforeQuit: @escaping () -> Void, dismiss: @escaping () -> Void) {
         let old = Bundle.main.bundleURL.path
         let pid = ProcessInfo.processInfo.processIdentifier
         let script = """
@@ -153,7 +192,12 @@ final class Updater: ObservableObject {
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = ["-c", script]
         try? p.run()
-        NSApp.terminate(nil)
+        dismiss()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            beforeQuit()
+            NSApp.terminate(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { exit(0) }
+        }
     }
 }
 
@@ -161,6 +205,7 @@ struct UpdateSheet: View {
     @ObservedObject var updater: Updater
     let release: Release
     let canQuit: () -> Bool
+    let beforeQuit: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -172,11 +217,14 @@ struct UpdateSheet: View {
                     .textSelection(.enabled)
             }
             .frame(height: 180)
-            if let s = updater.state { Text(s).font(.caption).foregroundStyle(.secondary) }
+            if let v = updater.progress {
+                ProgressView(value: v)
+            }
+            if let s = updater.state { Text(s).font(.caption).foregroundStyle(.secondary).monospacedDigit() }
             HStack {
                 Spacer()
                 Button("나중에") { updater.available = nil }.disabled(updater.busy)
-                Button("지금 업데이트") { updater.install(release, canQuit: canQuit) }
+                Button("지금 업데이트") { updater.install(release, canQuit: canQuit, beforeQuit: beforeQuit) }
                     .buttonStyle(.borderedProminent)
                     .disabled(updater.busy)
             }

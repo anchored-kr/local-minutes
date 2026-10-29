@@ -25,7 +25,7 @@ struct LocalMinutesApp: App {
                 updater.checkOnLaunch()
             }
             .sheet(item: Binding(get: { updater.available }, set: { updater.available = $0 })) { r in
-                UpdateSheet(updater: updater, release: r, canQuit: { model.isIdle })
+                UpdateSheet(updater: updater, release: r, canQuit: { model.isIdle }, beforeQuit: { model.stopWorker() })
             }
             .onChange(of: updater.state) { _, s in
                 if let s, updater.available == nil { model.toast = s }
