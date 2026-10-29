@@ -264,14 +264,49 @@ def split_sentences(seg):
     return out
 
 
-def whisper_prompt(terms="", previous=""):
-    """whisper 초기 프롬프트. 용어 목록 · 회의 맥락 · 앞 문장. whisper 는 프롬프트가 길면 앞쪽을 잘라내므로
-    (약 220 토큰), 짧게 유지하고 맥락은 뒤쪽에 둔다."""
+TERM_LINE = re.compile(r"^\s*(?:[-*•]\s*)?(용어|참석자?|이름|terms?|glossary|names?|attendees|participants|用語|参加者)\s*[:：]\s*(.+)$", re.I | re.M)
+PROPER = re.compile(r"\b[A-Z][A-Za-z0-9&'.]*(?:[ -][A-Z][A-Za-z0-9&'.]*)*\b")
+HANGUL_KANA = re.compile(r"[가-힣ぁ-んァ-ヶ]")
+
+
+def context_terms(context, lang="auto", limit=120):
+    """맥락에서 whisper 에 줄 '용어'만 뽑는다: '용어:' · '참석:' 줄의 항목과 영문 고유명사.
+
+    2026-10-29 영어 회의에서 맥락(2.5만 자 한국어 보고서) 앞 160자를 그대로 whisper 프롬프트로 넘기자,
+    언어를 English 로 정했는데도 한국어로 옮겨 쓰거나 맥락 문장('…적었으나', 날짜)을 지어냈다.
+    whisper 는 프롬프트를 '앞서 나온 말'로 여겨 그 언어 · 문장을 따라간다. 문장 · 날짜 · 숫자는 넘기지 않는다.
+    """
+    items = []
+    for m in TERM_LINE.finditer(context):
+        items += [t.strip(" .·") for t in re.split(r"[,，、·/]|\s{2,}", m.group(2))]
+    items += PROPER.findall(context)
+    out, seen = [], set()
+    for t in items:
+        t = re.sub(r"\(.*?\)", "", t).strip(" .·:-")
+        if not t or len(t) < 2 or re.search(r"\d", t) or len(t) > 30:
+            continue
+        if lang == "en" and HANGUL_KANA.search(t):
+            continue
+        if t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        out.append(t)
+    text = ""
+    for t in out:
+        if len(text) + len(t) + 2 > limit:
+            break
+        text = f"{text}, {t}" if text else t
+    return text
+
+
+def whisper_prompt(terms="", previous="", lang="auto"):
+    """whisper 초기 프롬프트 = 용어 목록뿐. 앞 문장은 넘기지 않는다 — 한 번 생긴 헛문장이 다음 조각으로
+    이어져 반복됐다(2026-10-29). previous 는 호환용으로만 받는다."""
     glossary = ""
     if GLOSSARY.exists():
-        glossary = " ".join(l.strip() for l in GLOSSARY.read_text(encoding="utf-8").splitlines() if l.strip() and not l.startswith("#"))
-    terms = " ".join(terms.split())
-    return " ".join(p for p in (previous[-60:], glossary[:120], terms[:160]) if p).strip()
+        glossary = ", ".join(l.strip() for l in GLOSSARY.read_text(encoding="utf-8").splitlines() if l.strip() and not l.startswith("#"))
+    words = ", ".join(p for p in (context_terms(glossary, lang, 80) if glossary else "", context_terms(terms, lang)) if p)
+    return f"Glossary: {words}." if words else ""
 
 
 def transcribe(mono, out, lang, use_vad=False, context="", name="whisper", terms=""):
@@ -282,7 +317,7 @@ def transcribe(mono, out, lang, use_vad=False, context="", name="whisper", terms
            "-t", str(max(4, (os.cpu_count() or 8) - 2))]
     if use_vad:
         cmd += ["--vad", "-vm", str(VAD_MODEL)]
-    hint = whisper_prompt(terms, context)
+    hint = whisper_prompt(terms, context, lang)
     if hint:
         cmd += ["--prompt", hint]
     t0 = time.time()
@@ -338,7 +373,9 @@ def label_speakers(segs, audio):
     kept = []
     for i, s in enumerate(segs):
         lv = [per[c][i] / norms[c] for c in range(len(levels))]
-        if max(lv) < 0.05:
+        # 채널마다 맞춘 값이 작거나, 두 채널 모두 실제 소리가 아주 작으면(약 -47 dBFS 미만) 무음에서 지어낸 문장이다
+        # (2026-10-29 회의 시작 전 3분: "I'm going to go ahead and get started").
+        if max(lv) < 0.05 or max(per[c][i] for c in range(len(levels))) < 150:
             continue
         if len(lv) == 2:
             s["speaker"] = "나" if lv[0] >= lv[1] else "상대"
@@ -426,7 +463,8 @@ def diarize_others(segs, x, sp, embedder=None, n_speakers=None):
         return 0
     previous = [int(m.group(1)) - 1 if (m := re.fullmatch(r"상대(\d+)", s["speaker"])) else 0 for s in others]
     found = sp.diarize(others, x, embedder or sp.Embedder(), n_speakers=n_speakers)
-    for s, k in zip(others, keep_numbers(found, previous)):
+    numbers = keep_numbers(found, previous) if len(set(previous)) > 1 else found   # 이전 번호가 없으면 처음 나온 차례대로
+    for s, k in zip(others, numbers):
         s["speaker"] = f"상대{k + 1}"
     return len(set(found))
 
@@ -982,6 +1020,8 @@ def process(args):
     if not network_blocked():
         sys.exit("네트워크가 막히지 않았습니다. 안전을 위해 멈춥니다.")
     src = Path(args.path).expanduser().resolve()
+    if not src.exists():
+        sys.exit(f"없는 경로입니다: {src}")   # 없는 경로로 빈 회의를 만들지 않게(2026-10-29)
     out = src if src.is_dir() else meeting_dir(src.stem)
     title = (out / "title.txt").read_text(encoding="utf-8").strip() if (out / "title.txt").exists() else (
         src.stem if src.is_file() else "회의")
@@ -1037,13 +1077,122 @@ JUNK = re.compile(r"(.)\1{4,}|(..)\2{3,}")
 LETTER = re.compile(r"[A-Za-z0-9가-힣ぁ-んァ-ヶ一-龥]")
 
 
-def plausible(text, seg=None):
-    """무음 · 잡음에서 whisper 가 지어낸 문장을 거른다(2026-10-28 실녹음: '롤롤롤롤', 'ᅠᅠᅠᅡ')."""
+def compression_ratio(text):
+    import zlib
+    b = text.encode("utf-8")
+    return len(b) / max(1, len(zlib.compress(b)))
+
+
+def plausible(text, seg=None, lang=None, context_norm=""):
+    """무음 · 잡음에서 whisper 가 지어낸 문장을 거른다.
+
+    2026-10-28: '롤롤롤롤', 'ᅠᅠᅠᅡ'. 2026-10-29: '107-02-2014 - 107-02-2014 …'(긴 패턴 반복 → 압축률),
+    영어로 정한 회의에 한국어 문장(→ 글자 비율), 맥락 문장 베끼기(→ 맥락에 그대로 있는 문장).
+    """
     if not LETTER.search(text) or JUNK.search(text.replace(" ", "")):
+        return False
+    if len(text) >= 30 and compression_ratio(text) > 2.4:
+        return False
+    letters = [c for c in text if c.isalpha()]
+    if lang == "en" and letters and sum(1 for c in letters if HANGUL_KANA.match(c)) / len(letters) > 0.3:
+        return False
+    norm = "".join(c for c in text.lower() if c.isalnum())
+    if context_norm and len(norm) >= 10 and norm in context_norm:
         return False
     if seg is not None and (seg.get("no_speech_prob", 0) > 0.6 or seg.get("avg_logprob", 0) < -1.0):
         return False
     return True
+
+
+LANG_CODE = {"korean": "ko", "english": "en", "japanese": "ja"}
+
+
+def norm_text(t):
+    return "".join(c for c in t.lower() if c.isalnum())
+
+
+class MeetingState:
+    """회의 하나의 전사 상태: 언어 고정 · 최근 문장(반복 거르기) · 맥락(용어 · 베끼기 거르기)."""
+
+    LOCK_AFTER = 3   # 같은 언어가 확실하게(≥0.8) 세 조각 나오면 고정. 첫 조각 인사말(한 · 일)로 잘못 고정하지 않게.
+
+    def __init__(self, lang="auto"):
+        self.fixed = lang if lang in ("ko", "en", "ja") else None
+        self.votes = []
+        self.recent = []
+        self.terms = ""
+        self.ctx = ""
+
+    def set_context(self, context):
+        if context != self.terms:
+            self.terms = context or ""
+            self.ctx = norm_text(self.terms)
+            words = [w.strip() for w in context_terms(self.terms, "auto", 400).split(",") if w.strip()]
+            self.term_set = {w.lower() for w in words}
+            self.prefix = re.compile(r"^\s*(?:(?:%s)\s*[,:]\s*)+" % "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))) if words else None
+
+    def clean(self, text):
+        """프롬프트(용어 목록)가 새어 나온 것을 지운다: 앞에 붙은 '이름:' · 용어만 늘어놓은 줄
+        (2026-10-29: 'Braden Kelley: Sure.', 'Braden, Revel Studios, Braden, Revel …')."""
+        if not getattr(self, "term_set", None):
+            return text
+        parts = [p.strip(" .") for p in re.split(r"[,:]", text) if p.strip(" .")]
+        rest = [p for p in parts if p.lower() not in self.term_set]
+        if len(parts) >= 3 and len(rest) / len(parts) <= 0.4 and all(len(p.split()) <= 2 for p in rest):
+            return ""   # 용어만 늘어놓은 줄
+        stripped = False
+        if self.prefix and re.match(r"^[^:]{1,60}:", text):
+            text = self.prefix.sub("", text).strip()   # 앞에 붙은 '이름:'
+            stripped = True
+        # 앞에 용어가 쉼표로 이어 붙은 것('Braden Kelley, GeekOut, Google, … and see if', 'Braden Kelley, M.')을 뗀다
+        lead = 0
+        for p in parts:
+            if p.lower() in self.term_set:
+                lead += 1
+            else:
+                break
+        if lead and len(parts) > lead and "," in text:
+            rest = re.split(r"[,:]", text, maxsplit=lead)[-1].strip()
+            rest = re.sub(r"^(and|or)\s+", "", rest)
+            # 용어가 둘 이상이면 떼고, 하나면('Mao, can you hear me?' 처럼 부르는 말일 수 있어) 남는 게 없을 때만 버린다
+            if lead >= 2 or len(norm_text(rest)) < 3:
+                text, stripped = rest, True
+        if stripped and len(norm_text(text)) < 3:
+            return ""   # 떼고 나니 남는 게 없다
+        return text
+
+    @property
+    def lang(self):
+        return self.fixed or "auto"
+
+    def observe(self, res, n_segs):
+        if self.fixed or not n_segs:
+            return
+        code = LANG_CODE.get(str(res.get("detected_language") or res.get("language") or "").lower())
+        if code and (res.get("detected_language_probability") or 0) >= 0.8:
+            self.votes.append(code)
+            last = self.votes[-self.LOCK_AFTER:]
+            if len(last) == self.LOCK_AFTER and len(set(last)) == 1:
+                self.fixed = code
+                say(f"언어 고정: {code}")
+
+    def keep(self, text):
+        """같은 문장(10자 이상)이 최근 12문장 안에 또 나오면 버린다 — 헛문장이 조각마다 반복되던 것."""
+        n = norm_text(text)
+        if len(n) >= 10 and n in self.recent:
+            return False
+        self.recent = (self.recent + [n])[-12:]
+        return True
+
+    def segments(self, res):
+        segs = [p for s in res.get("segments", []) if plausible(s["text"], s, self.fixed, self.ctx)
+                for p in server_sentences(s)]
+        out = []
+        for p in segs:
+            p["text"] = self.clean(p["text"])
+            if p["text"] and plausible(p["text"], None, self.fixed, self.ctx) and self.keep(p["text"]):
+                out.append(p)
+        return out
 
 
 def server_sentences(seg):
@@ -1134,6 +1283,7 @@ def worker(args):
     server = WhisperServer()   # 준비 중에 끊기면 스스로 끈다
     sp = speakers_module()
     live = {}   # 회의 폴더 → LiveSpeakers
+    states = {}   # 회의 폴더 → MeetingState
     say(f"전사 작업자 준비: {time.time() - t0:.1f}초 · 화자 분리 {'켬' if sp else '끔(.venv 없음)'}")
     print(json.dumps({"ready": True, "speakers": bool(sp)}), flush=True)
     try:
@@ -1154,10 +1304,12 @@ def worker(args):
                 mono = stereo.with_name(stereo.stem + "-mono.wav")
                 t1 = time.time()
                 to_mono(stereo, mono)
-                res = server.transcribe(mono, req.get("lang", "auto"), whisper_prompt(req.get("terms", ""), req.get("context", "")))
+                st = states.setdefault(meeting, MeetingState(req.get("lang", "auto")))
+                st.set_context(req.get("terms", ""))
+                res = server.transcribe(mono, st.lang, whisper_prompt(st.terms, lang=st.lang))
                 mono.unlink(missing_ok=True)
-                segs = [p for s in res.get("segments", []) if plausible(s["text"], s)
-                        for p in server_sentences(s) if p["text"] and plausible(p["text"])]
+                segs = st.segments(res)
+                st.observe(res, len(segs))
                 segs = label_speakers(segs, stereo) if segs else []
                 off = float(req.get("offset", 0))
                 if sp and segs:
@@ -1198,6 +1350,79 @@ def chunk(args):
         s["start"] = round(s["start"] + args.offset, 2)
         s["end"] = round(s["end"] + args.offset, 2)
     print(json.dumps({"language": detected, "segments": segs}, ensure_ascii=False), flush=True)
+
+
+def slice_windows(stereo, min_s=10, max_s=28):
+    """녹음을 말이 끊긴 곳(0.3초 조용)에서 10~28초 창으로 나눈다. [(시작 표본, 끝 표본)]."""
+    with wave.open(str(stereo)) as w:
+        rate, n = w.getframerate(), w.getnframes()
+        a = array.array("h", w.readframes(n))
+    step, quiet = rate // 10, int(rate * 0.3)
+    cuts, start, k = [], 0, 0
+    while k < n:
+        k = min(n, k + step)
+        length = k - start
+        if length >= max_s * rate:
+            cuts.append((start, k)); start = k
+        elif length >= min_s * rate:
+            tail = a[2 * (k - quiet):2 * k]
+            if tail and (sum(v * v for v in tail[::8]) / max(1, len(tail[::8]))) ** 0.5 < 330:
+                cuts.append((start, k)); start = k
+    if n - start > rate // 2:
+        cuts.append((start, n))
+    return cuts, rate, a
+
+
+def retranscribe(args):
+    """끝난 회의를 녹음(audio.m4a)으로 처음부터 다시 전사하고 화자를 나눈다. 바꾼 화자 이름은 남긴다."""
+    reexec_in_sandbox()
+    if not network_blocked():
+        sys.exit("네트워크가 막히지 않았습니다. 안전을 위해 멈춥니다.")
+    out = Path(args.path).resolve()
+    audio = out / "audio.m4a"
+    if not audio.exists():
+        sys.exit("audio.m4a 가 없습니다.")
+    lang = args.lang or ((out / "language.txt").read_text().strip() if (out / "language.txt").exists() else "auto")
+    stereo, part = out / ".re.wav", out / ".re-part.wav"
+    afconvert(audio, stereo, "-f", "WAVE", "-d", "LEI16@16000", "-c", "2")
+    t0 = time.time()
+    server = WhisperServer()
+    segs = []
+    try:
+        st = MeetingState(lang)
+        st.set_context(read_context(out))
+        cuts, rate, a = slice_windows(stereo)
+        for i, (b, e) in enumerate(cuts, 1):
+            with wave.open(str(part), "wb") as w:
+                w.setnchannels(2); w.setsampwidth(2); w.setframerate(rate)
+                w.writeframes(a[2 * b:2 * e].tobytes())
+            mono = out / ".re-mono.wav"
+            to_mono(part, mono)
+            res = server.transcribe(mono, st.lang, whisper_prompt(st.terms, lang=st.lang))
+            got = st.segments(res)
+            st.observe(res, len(got))
+            got = label_speakers(got, part) if got else []
+            for s in got:
+                s["start"] = round(s["start"] + b / rate, 2)
+                s["end"] = round(s["end"] + b / rate, 2)
+            segs += got
+            if i % 10 == 0:
+                say(f"  다시 전사 {i}/{len(cuts)} · {time.time() - t0:.0f}초")
+    finally:
+        server.close()
+        for f in (part, out / ".re-mono.wav"):
+            f.unlink(missing_ok=True)
+    try:
+        others = int((out / "others.txt").read_text().strip() or 0) if (out / "others.txt").exists() else 0
+        segs = diarize_offline(segs, stereo, others or None)
+    finally:
+        stereo.unlink(missing_ok=True)
+    title = (out / "title.txt").read_text(encoding="utf-8").strip() if (out / "title.txt").exists() else out.name
+    if (out / "transcript.json").exists():
+        (out / "transcript.prev.json").write_text((out / "transcript.json").read_text(encoding="utf-8"), encoding="utf-8")
+    write_transcript(segs, out, title)
+    say(f"다시 전사 끝: {len(segs)}문장 · 언어 {st.lang} · {time.time() - t0:.0f}초")
+    print(json.dumps({"segments": len(segs), "language": st.lang}), flush=True)
 
 
 def respeak(args):
@@ -1292,6 +1517,10 @@ def main():
     ch.set_defaults(fn=chunk)
     wk = sub.add_parser("worker", help="(앱용) 상주 전사 작업자")
     wk.set_defaults(fn=worker)
+    rt = sub.add_parser("retranscribe", help="끝난 회의를 녹음으로 다시 전사 · 화자 나누기")
+    rt.add_argument("path")
+    rt.add_argument("-l", "--lang", default="", help="ko · en · ja · auto (기본: 회의에 정한 언어)")
+    rt.set_defaults(fn=retranscribe)
     rs = sub.add_parser("respeak", help="끝난 회의의 상대 화자를 다시 나누기")
     rs.add_argument("path")
     rs.add_argument("-n", "--count", type=int, default=0, help="상대 인원(모르면 0 = 자동)")

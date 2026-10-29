@@ -453,6 +453,9 @@ struct TranscriptView: View {
                     Divider()
                     Button("화자 다시 나누기") { model.respeak(doc) }
                         .disabled(live || doc.respeaking || !doc.hasRecording)
+                    Button("전사 다시 하기 (녹음으로)") { model.retranscribe(doc) }
+                        .disabled(live || doc.respeaking || !doc.hasRecording)
+                        .help("저장된 녹음으로 처음부터 다시 전사하고 화자를 나눕니다. 위의 상대 인원 · 회의 언어를 씁니다.")
                 } label: {
                     Label("화자", systemImage: "person.2")
                 }

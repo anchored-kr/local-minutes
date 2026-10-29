@@ -261,6 +261,7 @@ final class MeetingDoc: ObservableObject {
            let segs = try? JSONDecoder().decode([Segment].self, from: data) {
             segments = segs
         }
+        renumberIfUnnamed()
         saveTranscript()
     }
 
@@ -288,7 +289,21 @@ final class MeetingDoc: ObservableObject {
         for i in segments.indices {
             if let s = labels[segments[i].start] { segments[i].speaker = s }
         }
+        renumberIfUnnamed()
         saveTranscript()
+    }
+
+    /// 상대에 이름을 붙인 적이 없으면 번호를 처음 나온 차례대로 상대1, 상대2 … 로 다시 매긴다
+    /// (회의 중 임시 번호를 이어받아 한 명뿐인데 '상대2'로 남던 것).
+    func renumberIfUnnamed() {
+        guard !speakerNames.keys.contains(where: { $0.hasPrefix("상대") }) else { return }
+        var map: [String: String] = [:]
+        for s in segments {
+            if let k = s.speaker, k.hasPrefix("상대"), map[k] == nil { map[k] = "상대\(map.count + 1)" }
+        }
+        for i in segments.indices {
+            if let k = segments[i].speaker, let n = map[k] { segments[i].speaker = n }
+        }
     }
 
     /// 회의록 언어: 고른 언어, 자동이면 조각에서 가장 많이 나온 언어.
@@ -657,6 +672,27 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async { doc.status = nil }
             }
             writeMinutes(doc)
+        }
+    }
+
+    /// 끝난 회의를 녹음(audio.m4a)으로 처음부터 다시 전사하고 화자를 나눈다(minutes.py retranscribe).
+    func retranscribe(_ doc: MeetingDoc) {
+        guard !doc.respeaking, recordingID != doc.id else { return }
+        doc.flushSaves()
+        doc.respeaking = true
+        doc.status = "전사 다시 하는 중… (녹음 길이의 약 절반)"
+        let lang = doc.language == .auto ? "auto" : doc.language.rawValue
+        transcribeQueue.async {
+            let (code, _) = Pipeline.run(["retranscribe", doc.dir.path, "-l", lang], log: doc.log)
+            DispatchQueue.main.async {
+                doc.respeaking = false
+                if code == 0 {
+                    doc.reloadTranscript()
+                    doc.status = "전사 다시 함 · \(doc.segments.count)문장"
+                } else {
+                    doc.status = "전사 다시 하기 실패: \(Pipeline.lastLogLines(doc.log, 2))"
+                }
+            }
         }
     }
 
