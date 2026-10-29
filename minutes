@@ -1,0 +1,6 @@
+#!/bin/zsh
+# .venv(화자 분리용 sherpa-onnx · numpy)가 있으면 그 Python 을 쓴다.
+root=${0:A:h}
+py=/opt/homebrew/bin/python3
+[[ -x "$root/.venv/bin/python" ]] && py="$root/.venv/bin/python"
+exec "$py" -I "$root/minutes.py" "$@"

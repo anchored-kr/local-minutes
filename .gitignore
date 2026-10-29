@@ -1,0 +1,13 @@
+# 데이터 · 모델 · 빌드 결과는 저장소에 올리지 않는다
+models
+meetings
+.venv/
+dist/
+__pycache__/
+*.pyc
+*.log
+recorder/*.app
+recorder/vfs-overlay.yaml
+recorder/empty.modulemap
+app/AppIcon.iconset/
+.DS_Store
