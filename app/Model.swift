@@ -80,6 +80,12 @@ func readText(_ url: URL) -> String {
     (try? String(contentsOf: url, encoding: .utf8)) ?? ""
 }
 
+/// 3분 12초 · 45초
+func durationLabel(_ s: Double) -> String {
+    let t = max(0, Int(s.rounded()))
+    return t >= 60 ? "\(t / 60)분 \(t % 60)초" : "\(t)초"
+}
+
 func copyToClipboard(_ text: String) {
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(text, forType: .string)
@@ -224,6 +230,11 @@ final class MeetingDoc: ObservableObject {
     @Published var hasRecording: Bool
     @Published var pendingChunks = 0
     @Published var writingMinutes = false
+    /// 회의록 진행(엔진이 app.log 에 남기는 '@@진행 비율 어림초 단계' 줄을 읽는다)
+    @Published var minutesProgress: Double = 0
+    @Published var minutesStage = ""
+    @Published var minutesStart: Date?
+    @Published var minutesEstimate: Double = 0
     @Published var status: String?
 
     private var saveWork: [String: DispatchWorkItem] = [:]
@@ -311,6 +322,32 @@ final class MeetingDoc: ObservableObject {
         if language != .auto { return language.rawValue }
         let counts = Dictionary(detectedLanguages.map { ($0, 1) }, uniquingKeysWith: +)
         return counts.max { $0.value < $1.value }?.key ?? "ko"
+    }
+
+    /// app.log 의 회의록 시작 뒤 부분에서 마지막 '@@진행' 줄을 읽는다.
+    func readMinutesProgress(from offset: Int64) {
+        guard let h = try? FileHandle(forReadingFrom: log) else { return }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        let start = max(UInt64(offset), size > 8192 ? size - 8192 : 0)
+        try? h.seek(toOffset: start)
+        let tail = String(decoding: h.readDataToEndOfFile(), as: UTF8.self)
+        guard let line = tail.split(separator: "\n").last(where: { $0.hasPrefix("@@진행 ") }) else { return }
+        let parts = line.split(separator: " ", maxSplits: 3).map(String.init)
+        guard parts.count >= 4, let f = Double(parts[1]) else { return }
+        minutesProgress = f
+        minutesEstimate = Double(parts[2]) ?? 0
+        minutesStage = parts[3]
+    }
+
+    /// 남은 시간(초): 진행이 쌓이면 실제 속도로, 그전에는 엔진의 처음 어림으로.
+    func minutesRemaining(now: Date = Date()) -> Double? {
+        guard let start = minutesStart else { return nil }
+        let elapsed = now.timeIntervalSince(start)
+        if minutesProgress >= 0.15 && elapsed > 20 {
+            return max(0, elapsed * (1 - minutesProgress) / minutesProgress)
+        }
+        return minutesEstimate > 0 ? max(10, minutesEstimate - elapsed) : nil
     }
 
     // MARK: 화자
@@ -671,7 +708,12 @@ final class AppModel: ObservableObject {
                 _ = Pipeline.run(["finalize", doc.dir.path], log: doc.log)
                 DispatchQueue.main.async { doc.status = nil }
             }
-            writeMinutes(doc)
+            // 설정에서 끄면 회의가 끝나도 회의록을 바로 쓰지 않는다(무거운 작업이라 한가할 때 '회의록 쓰기'로)
+            if UserDefaults.standard.object(forKey: "autoMinutes") as? Bool ?? true {
+                writeMinutes(doc)
+            } else {
+                doc.status = "회의 끝 · 회의록은 '회의록 쓰기'를 누르면 씁니다"
+            }
         }
     }
 
@@ -734,13 +776,27 @@ final class AppModel: ObservableObject {
                 return chosen == "auto" ? doc.minutesLanguage : chosen
             }
             let style = UserDefaults.standard.string(forKey: "minutesStyle") ?? "detailed"
+            // 진행 게이지: 엔진이 기록에 남기는 진행 줄을 1초마다 읽는다
+            let logStart = (try? FileManager.default.attributesOfItem(atPath: doc.log.path)[.size] as? Int64) ?? 0
+            let timer = DispatchQueue.main.sync { () -> Timer in
+                doc.minutesStart = Date()
+                doc.minutesProgress = 0
+                doc.minutesStage = "회의록 엔진 준비"
+                doc.minutesEstimate = 0
+                return Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+                    Task { @MainActor in doc.readMinutesProgress(from: logStart) }
+                }
+            }
             let (code, _) = Pipeline.run(["notes", doc.dir.path, "-o", lang, "-s", style], log: doc.log)
+            DispatchQueue.main.sync { timer.invalidate() }
             let text = readText(doc.dir.appendingPathComponent("minutes.md"))
             DispatchQueue.main.async {
                 doc.writingMinutes = false
+                let took = doc.minutesStart.map { Date().timeIntervalSince($0) } ?? 0
+                doc.minutesStart = nil
                 if code == 0 {
                     doc.minutes = text
-                    doc.status = nil
+                    doc.status = "회의록 완료 · \(durationLabel(took)) 걸림"
                 } else {
                     doc.status = "회의록 실패: \(Pipeline.lastLogLines(doc.log, 2))"
                 }

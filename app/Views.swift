@@ -244,6 +244,7 @@ struct MeetingView: View {
     @State private var tab = 0
     @AppStorage("minutesStyle") private var minutesStyle = "detailed"
     @AppStorage("minutesLang") private var minutesLang = "ko"
+    @AppStorage("autoMinutes") private var autoMinutes = true
 
     private var isRecording: Bool { model.recordingID == doc.id }
 
@@ -281,6 +282,9 @@ struct MeetingView: View {
                             .labelsHidden()
                             .frame(width: 100)
                             .help("회의록을 쓸 언어")
+                            Toggle("자동", isOn: $autoMinutes)
+                                .toggleStyle(.checkbox)
+                                .help("회의가 끝나면 바로 회의록을 씁니다. 끄면 '회의록 쓰기'를 누를 때 씁니다(무거운 작업이라 한가할 때).")
                             if !doc.minutes.isEmpty {
                                 Button { model.copy(doc.minutes, what: "회의록") } label: {
                                     Label("복사", systemImage: "doc.on.doc")
@@ -370,16 +374,31 @@ struct MeetingView: View {
     @ViewBuilder
     private var minutesPane: some View {
         if doc.writingMinutes {
-            VStack(spacing: 10) {
-                ProgressView()
-                Text(doc.pendingChunks > 0 ? "남은 전사를 마치는 중…" : "이 맥의 Gemma 4 로 회의록을 쓰는 중…")
-                    .foregroundStyle(.secondary)
-                if minutesStyle == "detailed" {
-                    Text("상세 회의록은 주제마다 따로 써서 30분 회의에 5~10분 걸립니다. 진행 상황은 app.log 에 남습니다.")
-                        .font(.caption).foregroundStyle(.tertiary)
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                VStack(spacing: 10) {
+                    if doc.minutesStart == nil {
+                        ProgressView()
+                        Text(doc.pendingChunks > 0 ? "남은 전사를 마치는 중…" : "화자 정리 · 녹음 저장을 마치는 중…")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("이 맥의 Gemma 4 로 회의록을 쓰는 중").font(.headline)
+                        ProgressView(value: doc.minutesProgress)
+                            .frame(width: 360)
+                        Text("\(Int(doc.minutesProgress * 100))% · \(doc.minutesStage)")
+                            .foregroundStyle(.secondary).monospacedDigit()
+                        HStack(spacing: 16) {
+                            Label(durationLabel(ctx.date.timeIntervalSince(doc.minutesStart ?? ctx.date)) + " 지남", systemImage: "clock")
+                            if let r = doc.minutesRemaining(now: ctx.date) {
+                                Label(r < 60 ? "1분 안에 끝남" : "약 \(durationLabel((r / 10).rounded() * 10)) 남음", systemImage: "hourglass")
+                            }
+                        }
+                        .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                        Text("다른 앱도 함께 쓰도록 낮은 우선순위로 씁니다. 창을 닫아도 계속 씁니다.")
+                            .font(.caption).foregroundStyle(.tertiary)
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             editor($doc.minutes, placeholder: doc.hasRecording ? "회의록이 아직 없습니다. 위의 '회의록 쓰기'를 누르세요."
                                                                  : "회의가 끝나면 회의록이 여기에 생깁니다.")

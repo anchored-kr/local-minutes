@@ -655,13 +655,40 @@ def free_port():
     return p
 
 
+def progress(frac, label, eta=None):
+    """앱이 회의록 게이지에 쓰는 진행 줄(stderr → app.log): '@@진행 0.350 120 절 2/7'.
+    eta = 처음 어림한 전체 걸리는 시간(초, 모르면 0). 앱은 진행이 쌓이면 실제 속도로 다시 계산한다."""
+    say(f"@@진행 {frac:.3f} {int(eta or 0)} {label}")
+
+
+def estimate_seconds(chars, detailed):
+    """회의록이 걸릴 시간 어림(초). 실측(M1 Pro 32 GB): 상세 · 전사 2.3만 자 약 6분, 8천 자 약 9~14분(다른 앱으로 바쁠 때),
+    간단 · 짧은 회의 20~50초. 모델을 읽는 데 30~60초."""
+    if detailed:
+        return 120 + 8 * 45 + chars / 100
+    return 45 + chars / 400
+
+
+def fit_ctx(*texts, out=4096):
+    """회의록 엔진의 작업 공간(토큰)을 들어갈 글 길이에 맞춘다. 항상 65536 을 잡으면 짧은 회의에도 작업 메모리를
+    크게 잡아, 다른 앱이 많은 맥(32 GB)에서 스왑이 늘고 맥 전체가 느려졌다(2026-10-30). 글자 2개 ≈ 1토큰으로 넉넉히 잡는다."""
+    need = sum(len(t) for t in texts) // 2 + out + 2048
+    ctx = 16384
+    while ctx < need and ctx < 65536:
+        ctx *= 2
+    return min(ctx, 65536)
+
+
 class LocalLLM:
     def __init__(self, ctx):
         self.port = free_port()
         LOGS.mkdir(parents=True, exist_ok=True)
         self.log = open(LOGS / "llama-server.log", "w")
+        say(f"  회의록 엔진 작업 공간 {ctx:,} 토큰 · 낮은 우선순위")
         self.proc = subprocess.Popen(
-            ["llama-server", "-m", str(LLM_MODEL), "--host", "127.0.0.1", "--port", str(self.port),
+            # 낮은 우선순위(utility): 회의록을 쓰는 동안 다른 앱이 먼저 돈다. 대신 회의록이 조금 늦게 나온다.
+            ["/usr/sbin/taskpolicy", "-c", "utility",
+             "llama-server", "-m", str(LLM_MODEL), "--host", "127.0.0.1", "--port", str(self.port),
              "-c", str(ctx), "-ngl", "99", "-fa", "on", "-np", "1", "--no-webui", "--jinja",
              # 생각하기 끔: 149자 전사에 생각만 1,600 토큰을 써 80초 넘게 걸렸다(2026-10-28).
              "--reasoning-budget", "0"],
@@ -777,8 +804,10 @@ def write_minutes(out, title, when, length, lang):
     chunk_chars = 40000
     chunks = [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)]
     say(f"회의록 쓰는 중 (로컬 모델, 글자 {len(text):,}자{f' · {len(chunks)}조각' if len(chunks) > 1 else ''})…")
+    eta = estimate_seconds(len(text), False)
+    progress(0.02, "회의록 엔진 준비", eta)
     t0 = time.time()
-    llm = LocalLLM(ctx=65536)
+    llm = LocalLLM(ctx=fit_ctx(chunks[0], glossary, fmt, SYSTEM_PROMPT))
     try:
         if len(chunks) == 1:
             body = text
@@ -790,7 +819,9 @@ def write_minutes(out, title, when, length, lang):
                                 f"\n\n<transcript>\n{c}\n</transcript>")
                 notes.append(f"### Part {i}\n{n}")
                 say(f"  조각 {i}/{len(chunks)} 끝")
+                progress(0.15 + 0.6 * i / len(chunks), f"긴 회의 나눠 읽기 {i}/{len(chunks)}", eta)
             body = "\n\n".join(notes)
+        progress(0.8 if len(chunks) > 1 else 0.15, "회의록 쓰는 중", eta)
         md, usage = llm.chat(system, f"{fmt}{glossary}\n\n<transcript>\n{body}\n</transcript>")
     finally:
         llm.close()
@@ -801,6 +832,7 @@ def write_minutes(out, title, when, length, lang):
     md = re.sub(r"(?m)^- (일시|Date|日時)\s*[:：].*$", lambda m: f"- {m.group(1)}: {when}", md, count=1)
     md = re.sub(r"(?m)^- (길이|Length|長さ)\s*[:：].*$", lambda m: f"- {m.group(1)}: {length_text}", md, count=1)
     (out / "minutes.md").write_text(md + "\n", encoding="utf-8")
+    progress(1.0, "끝", eta)
     say(f"회의록 끝: {time.time() - t0:.0f}초 · 입력 {usage.get('prompt_tokens', '?')} · 출력 {usage.get('completion_tokens', '?')} 토큰")
 
 
@@ -913,7 +945,10 @@ def write_minutes_detailed(out, title, lang):
     out_lang = LANG_NAMES[lang]
     t0 = time.time()
     say(f"상세 회의록 쓰는 중 (로컬 모델, 전사 {len(full):,}자)…")
-    llm = LocalLLM(ctx=65536)
+    eta = estimate_seconds(len(full), True)
+    progress(0.02, "회의록 엔진 준비", eta)
+    llm = LocalLLM(ctx=fit_ctx(full[:150000], background, DETAIL_SYSTEM, out=4096))
+    progress(0.05, "회의 정보 정리 중", eta)
     try:
         # ① 회의 정보
         meta_raw, _ = llm.chat(DETAIL_SYSTEM, f"""{background}
@@ -945,6 +980,7 @@ Return JSON with these keys, all values written in {out_lang}:
             background += f"\n\nSpeaker labels resolved to names in the transcript below: {json.dumps(guessed, ensure_ascii=False)}."
             say(f"  화자 이름 추정: {guessed}")
         say(f"  ① 회의 정보 · {time.time() - t0:.0f}초")
+        progress(0.10, "목차 잡는 중", eta)
         # ② 목차
         outline_raw, _ = llm.chat(DETAIL_SYSTEM, f"""{background}
 
@@ -960,6 +996,7 @@ Return JSON: {{"sections": [{{"title": "...in {out_lang}", "ranges": [["mm:ss", 
 "points": ["key facts to cover, in {out_lang}", ...]}}]}}""", max_tokens=3000, json_mode=True)
         sections = loads_json(outline_raw).get("sections", [])[:12]
         say(f"  ② 목차 {len(sections)}개 · {time.time() - t0:.0f}초")
+        progress(0.18, f"절 1/{len(sections)} 쓰는 중", eta)
         if not sections:
             raise RuntimeError("목차를 만들지 못했습니다")
         # 다른 절의 요점까지 보여 줘야 같은 사실을 여러 절에 되풀이하지 않는다(2026-10-29: VFX · 맵 내용이 두 절씩 반복)
@@ -1009,6 +1046,8 @@ Format (GitHub Markdown):
                 body = f"## {n}. {sec.get('title', '')}\n\n{body}"
             bodies.append(body)
             say(f"  ③ 절 {i + 1}/{len(sections)} · {time.time() - t0:.0f}초")
+            nxt = f"절 {i + 2}/{len(sections)} 쓰는 중" if i + 1 < len(sections) else "요약 · 결정 · Action Items 쓰는 중"
+            progress(0.18 + 0.67 * (i + 1) / len(sections), nxt, eta)
         n_dec, n_next, n_all = len(sections) + 2, len(sections) + 3, len(sections) + 4
         draft = "\n\n".join(bodies)
         # ④ 요약 · 결정 · 다음 확인 · 종합
@@ -1070,6 +1109,7 @@ Questions to confirm at the next meeting, grouped under 2-4 "### " category head
     if (out / "minutes.md").exists():
         (out / "minutes.prev.md").write_text((out / "minutes.md").read_text(encoding="utf-8"), encoding="utf-8")
     (out / "minutes.md").write_text(md, encoding="utf-8")
+    progress(1.0, "끝", eta)
     say(f"상세 회의록 끝: {time.time() - t0:.0f}초 · {len(md):,}자 · 절 {len(sections)}개")
 
 
